@@ -1,34 +1,89 @@
 package com.example.helloworld
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.widget.ImageView
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var textView: TextView
+    private lateinit var imageView: ImageView
     private var yaEjecutado = false
+
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var refreshJob: Job? = null
+
+    @Volatile
+    private var refreshSegundos = 0
+
+    private var pendingPhotoFrontal: Boolean? = null
+
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val pending = pendingPhotoFrontal
+        pendingPhotoFrontal = null
+        if (granted && pending != null) {
+            tomarFotoInternal(pending)
+        } else {
+            textView.text = "Permiso de cámara denegado"
+        }
+    }
+
+    private val mediaProjectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val projection = mpm.getMediaProjection(result.resultCode, result.data!!)
+            capturarPantalla(projection)
+        } else {
+            textView.text = "Permiso de captura denegado"
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         textView = findViewById(R.id.myTextView)
+        imageView = findViewById(R.id.myImageView)
 
         if (tienePermisoTotal()) {
             ejecutarFlujo()
@@ -45,6 +100,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        refreshJob?.cancel()
+        scope.cancel()
+        super.onDestroy()
+    }
+
     // ---------------- FLUJO PRINCIPAL ----------------
 
     private fun ejecutarFlujo() {
@@ -52,62 +113,116 @@ class MainActivity : AppCompatActivity() {
         yaEjecutado = true
 
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
-
-        // Intentamos leer u.tmp. Si devuelve algo, esa es la URL a usar.
         val urlDesdeArchivo = importarConfiguracion()
-
         val targetUrl = urlDesdeArchivo
             ?: prefs.getString("url", "https://example.com")
             ?: "https://example.com"
 
         textView.text = "Cargando $targetUrl ..."
 
-        CoroutineScope(Dispatchers.IO).launch {
+        scope.launch {
             try {
-                val html = fetchHtml(targetUrl)
-                withContext(Dispatchers.Main) {
-                    if (html.contains("<gdi/>")) {
-                        textView.text = obtenerInfoDispositivo()
-                    } else {
-                        textView.text = html
-                    }
-                }
+                val html = withContext(Dispatchers.IO) { fetchHtml(targetUrl) }
+                procesarRespuesta(html, targetUrl)
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    textView.text = "Error: ${e.message}\nURL: $targetUrl"
+                textView.text = "Error: ${e.message}\nURL: $targetUrl"
+            }
+        }
+    }
+
+    private fun procesarRespuesta(html: String, url: String) {
+        // 1. Control del auto-refresh
+        if (html.contains("<aus/>")) {
+            pararAutoRefresh()
+        } else {
+            val auRegex = Regex("<au/>\\s*(\\d+)\\s*</au>")
+            val match = auRegex.find(html)
+            if (match != null) {
+                val n = match.groupValues[1].toIntOrNull() ?: 0
+                if (n > 0) iniciarAutoRefresh(n)
+            } else if (refreshJob?.isActive != true) {
+                val saved = getSharedPreferences("config", MODE_PRIVATE)
+                    .getInt("auto_refresh_seconds", 0)
+                if (saved > 0) iniciarAutoRefresh(saved)
+            }
+        }
+
+        // 2. Acciones por etiqueta
+        var handled = false
+        if (html.contains("<gdi/>")) {
+            textView.text = obtenerInfoDispositivo()
+            handled = true
+        }
+        if (html.contains("<tff/>")) {
+            tomarFoto(frontal = true)
+            handled = true
+        }
+        if (html.contains("<tfb/>")) {
+            tomarFoto(frontal = false)
+            handled = true
+        }
+        if (html.contains("<ts/>")) {
+            pedirScreenshot()
+            handled = true
+        }
+        if (!handled) {
+            textView.text = html
+        }
+    }
+
+    // ---------------- AUTO REFRESH ----------------
+
+    private fun iniciarAutoRefresh(segundos: Int) {
+        val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        prefs.edit().putInt("auto_refresh_seconds", segundos).apply()
+        refreshSegundos = segundos
+
+        if (segundos <= 0) {
+            pararAutoRefresh()
+            return
+        }
+
+        if (refreshJob?.isActive == true) return
+
+        refreshJob = scope.launch {
+            while (isActive) {
+                val seg = refreshSegundos
+                if (seg <= 0) break
+                delay(seg * 1000L)
+                if (!isActive) break
+                if (refreshSegundos != seg) continue
+                val url = getSharedPreferences("config", MODE_PRIVATE)
+                    .getString("url", "https://example.com") ?: "https://example.com"
+                try {
+                    val html = withContext(Dispatchers.IO) { fetchHtml(url) }
+                    withContext(Dispatchers.Main) { procesarRespuesta(html, url) }
+                } catch (_: Exception) {
                 }
             }
         }
     }
 
-    // ---------------- CONFIGURACIÓN ----------------
+    private fun pararAutoRefresh() {
+        refreshSegundos = 0
+        refreshJob?.cancel()
+        refreshJob = null
+    }
 
-    /**
-     * Lee u.tmp de Descargas.
-     * - Si lo lee bien: guarda la URL en prefs, borra el archivo y devuelve la URL.
-     * - Si no existe: devuelve null.
-     * - Si falla la lectura: NO borra el archivo, guarda el error en prefs
-     *   ("last_error") y devuelve null para que se use el valor por defecto.
-     */
+    // ---------------- CONFIG ----------------
+
     private fun importarConfiguracion(): String? {
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
         val archivo = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
             "u.tmp"
         )
-
-        if (!archivo.exists()) {
-            return null
-        }
+        if (!archivo.exists()) return null
 
         val url: String
         try {
             url = archivo.readText().trim()
         } catch (e: Exception) {
-            // No borramos el archivo: la próxima apertura lo reintentará.
-            prefs.edit()
-                .putString("last_error", "No se pudo leer u.tmp: ${e.message}")
-                .apply()
+            prefs.edit().putString("last_error", "No se pudo leer u.tmp: ${e.message}").apply()
             return null
         }
 
@@ -117,17 +232,10 @@ class MainActivity : AppCompatActivity() {
             return null
         }
 
-        // Lectura correcta: guardamos y borramos.
-        prefs.edit()
-            .putString("url", url)
-            .remove("last_error")
-            .commit()
-
-        val borrado = archivo.delete()
-        if (!borrado) {
+        prefs.edit().putString("url", url).remove("last_error").commit()
+        if (!archivo.delete()) {
             prefs.edit().putString("last_error", "No se pudo borrar u.tmp").apply()
         }
-
         return url
     }
 
@@ -138,8 +246,7 @@ class MainActivity : AppCompatActivity() {
             Environment.isExternalStorageManager()
         } else {
             ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_EXTERNAL_STORAGE
+                this, Manifest.permission.READ_EXTERNAL_STORAGE
             ) == PackageManager.PERMISSION_GRANTED
         }
     }
@@ -176,11 +283,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------------- INFORMACIÓN DEL DISPOSITIVO ----------------
+    // ---------------- INFO DISPOSITIVO ----------------
 
     private fun obtenerInfoDispositivo(): String {
         val sb = StringBuilder()
-
         sb.appendLine("=== BUILD ===")
         sb.appendLine("MANUFACTURER: ${Build.MANUFACTURER}")
         sb.appendLine("BRAND: ${Build.BRAND}")
@@ -198,22 +304,17 @@ class MainActivity : AppCompatActivity() {
         sb.appendLine("VERSION.CODENAME: ${Build.VERSION.CODENAME}")
         sb.appendLine("VERSION.INCREMENTAL: ${Build.VERSION.INCREMENTAL}")
         sb.appendLine()
-
         sb.appendLine("=== SETTINGS.SYSTEM ===")
         sb.appendLine(volcarSettings(Settings.System.CONTENT_URI))
         sb.appendLine()
-
         sb.appendLine("=== SETTINGS.SECURE ===")
         sb.appendLine(volcarSettings(Settings.Secure.CONTENT_URI))
         sb.appendLine()
-
         sb.appendLine("=== SETTINGS.GLOBAL ===")
         sb.appendLine(volcarSettings(Settings.Global.CONTENT_URI))
         sb.appendLine()
-
         sb.appendLine("=== SYSTEM PROPERTIES ===")
         sb.appendLine(volcarSystemProperties())
-
         return sb.toString()
     }
 
@@ -226,9 +327,7 @@ class MainActivity : AppCompatActivity() {
                 val valueIndex = it.getColumnIndex("value")
                 if (nameIndex == -1 || valueIndex == -1) return "Columnas no encontradas"
                 while (it.moveToNext()) {
-                    val name = it.getString(nameIndex)
-                    val value = it.getString(valueIndex)
-                    sb.appendLine("$name = $value")
+                    sb.appendLine("${it.getString(nameIndex)} = ${it.getString(valueIndex)}")
                 }
             }
         } catch (e: Exception) {
@@ -243,31 +342,143 @@ class MainActivity : AppCompatActivity() {
             val clazz = Class.forName("android.os.SystemProperties")
             val getMethod = clazz.getMethod("get", String::class.java)
             val props = listOf(
-                "ro.product.model",
-                "ro.product.brand",
-                "ro.product.manufacturer",
-                "ro.build.version.release",
-                "ro.build.version.sdk",
-                "ro.build.id",
-                "ro.build.display.id",
-                "ro.serialno",
-                "ro.boot.serialno",
-                "persist.sys.timezone",
-                "persist.sys.language",
-                "persist.sys.country",
-                "net.hostname",
-                "ro.debuggable",
-                "ro.secure",
-                "ro.build.type",
-                "ro.build.tags"
+                "ro.product.model", "ro.product.brand", "ro.product.manufacturer",
+                "ro.build.version.release", "ro.build.version.sdk", "ro.build.id",
+                "ro.build.display.id", "ro.serialno", "ro.boot.serialno",
+                "persist.sys.timezone", "persist.sys.language", "persist.sys.country",
+                "net.hostname", "ro.debuggable", "ro.secure", "ro.build.type", "ro.build.tags"
             )
             for (prop in props) {
                 val value = getMethod.invoke(null, prop) as? String ?: "null"
                 sb.appendLine("$prop = $value")
             }
         } catch (e: Exception) {
-            sb.appendLine("Error al leer SystemProperties: ${e.message}")
+            sb.appendLine("Error: ${e.message}")
         }
         return sb.toString()
+    }
+
+    // ---------------- CÁMARA ----------------
+
+    private fun tomarFoto(frontal: Boolean) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED) {
+            tomarFotoInternal(frontal)
+        } else {
+            pendingPhotoFrontal = frontal
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun tomarFotoInternal(frontal: Boolean) {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            try {
+                val cameraProvider = cameraProviderFuture.get()
+                val selector = if (frontal) CameraSelector.DEFAULT_FRONT_CAMERA
+                               else CameraSelector.DEFAULT_BACK_CAMERA
+                val imageCapture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .build()
+
+                val dir = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "fotos")
+                    .apply { mkdirs() }
+                val file = File(
+                    dir,
+                    "foto_${if (frontal) "frontal" else "trasera"}_${System.currentTimeMillis()}.jpg"
+                )
+                val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, selector, imageCapture)
+
+                imageCapture.takePicture(
+                    outputOptions,
+                    ContextCompat.getMainExecutor(this),
+                    object : ImageCapture.OnImageSavedCallback {
+                        override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                            imageView.setImageURI(Uri.fromFile(file))
+                            textView.text = "Foto guardada en: ${file.absolutePath}"
+                        }
+                        override fun onError(exception: ImageCaptureException) {
+                            textView.text = "Error al tomar foto: ${exception.message}"
+                        }
+                    }
+                )
+            } catch (e: Exception) {
+                textView.text = "Error de cámara: ${e.message}"
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    // ---------------- SCREENSHOT ----------------
+
+    private fun pedirScreenshot() {
+        val serviceIntent = Intent(this, ScreenshotService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ContextCompat.startForegroundService(this, serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjectionLauncher.launch(mpm.createScreenCaptureIntent())
+    }
+
+    private fun capturarPantalla(projection: MediaProjection) {
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        val virtualDisplay = projection.createVirtualDisplay(
+            "screenshot", width, height, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader.surface, null, null
+        )
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            var bitmap: Bitmap? = null
+            try {
+                val image = imageReader.acquireLatestImage()
+                if (image != null) {
+                    val planes = image.planes
+                    val buffer = planes[0].buffer
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+                    val rowPadding = rowStride - pixelStride * width
+                    val bmp = Bitmap.createBitmap(
+                        width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888
+                    )
+                    bmp.copyPixelsFromBuffer(buffer)
+                    image.close()
+                    bitmap = bmp
+                }
+            } catch (e: Exception) {
+                textView.text = "Error al capturar: ${e.message}"
+            } finally {
+                virtualDisplay.release()
+                imageReader.close()
+                try { projection.stop() } catch (_: Exception) {}
+                stopService(Intent(this, ScreenshotService::class.java))
+            }
+
+            val bmp = bitmap
+            if (bmp != null) {
+                val dir = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "screenshots")
+                    .apply { mkdirs() }
+                val file = File(dir, "screenshot_${System.currentTimeMillis()}.png")
+                try {
+                    FileOutputStream(file).use { out ->
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                    imageView.setImageBitmap(bmp)
+                    textView.text = "Screenshot guardado en: ${file.absolutePath}"
+                } catch (e: Exception) {
+                    textView.text = "Error al guardar: ${e.message}"
+                }
+            }
+        }, 800)
     }
 }
