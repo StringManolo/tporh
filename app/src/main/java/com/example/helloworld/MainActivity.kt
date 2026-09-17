@@ -160,43 +160,52 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- Permisos ----------------
 
-    private fun pedirPermisosExtra() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            != PackageManager.PERMISSION_GRANTED) {
-            cameraPermLauncher.launch(Manifest.permission.CAMERA)
-        }
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-            != PackageManager.PERMISSION_GRANTED) {
+private fun pedirPermisosExtra() {
+    // Cámara
+    val camOk = ContextCompat.checkSelfPermission(
+        this, Manifest.permission.CAMERA
+    ) == PackageManager.PERMISSION_GRANTED
+    if (!camOk) {
+        cameraPermLauncher.launch(Manifest.permission.CAMERA)
+    }
+
+    // Notificaciones (Android 13+)
+    if (Build.VERSION.SDK_INT >= 33) {
+        val notifOk = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!notifOk) {
             notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+}
 
-    private fun tienePermisoTotal(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
-        } else {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
-                == PackageManager.PERMISSION_GRANTED
-        }
+private fun tienePermisoTotal(): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        ContextCompat.checkSelfPermission(
+            this, Manifest.permission.READ_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
     }
+}
 
-    private fun pedirPermisoTotal() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val i = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-            i.data = Uri.parse("package:$packageName")
-            startActivity(i)
-        } else {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(
-                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                ),
-                100
-            )
-        }
+private fun pedirPermisoTotal() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val i = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+        i.data = Uri.parse("package:$packageName")
+        startActivity(i)
+    } else {
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ),
+            100
+        )
     }
+}
 
     // ---------------- Flujo principal ----------------
 
