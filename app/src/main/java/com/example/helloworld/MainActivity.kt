@@ -45,14 +45,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------------- FLUJO PRINCIPAL ----------------
+
     private fun ejecutarFlujo() {
         if (yaEjecutado) return
         yaEjecutado = true
 
-        importarConfiguracion()
-
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
-        val targetUrl = prefs.getString("url", "https://example.com")
+
+        // Intentamos leer u.tmp. Si devuelve algo, esa es la URL a usar.
+        val urlDesdeArchivo = importarConfiguracion()
+
+        val targetUrl = urlDesdeArchivo
+            ?: prefs.getString("url", "https://example.com")
             ?: "https://example.com"
 
         textView.text = "Cargando $targetUrl ..."
@@ -75,14 +80,66 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // --- Permisos y configuración (igual que antes) ---
+    // ---------------- CONFIGURACIÓN ----------------
+
+    /**
+     * Lee u.tmp de Descargas.
+     * - Si lo lee bien: guarda la URL en prefs, borra el archivo y devuelve la URL.
+     * - Si no existe: devuelve null.
+     * - Si falla la lectura: NO borra el archivo, guarda el error en prefs
+     *   ("last_error") y devuelve null para que se use el valor por defecto.
+     */
+    private fun importarConfiguracion(): String? {
+        val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        val archivo = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "u.tmp"
+        )
+
+        if (!archivo.exists()) {
+            return null
+        }
+
+        val url: String
+        try {
+            url = archivo.readText().trim()
+        } catch (e: Exception) {
+            // No borramos el archivo: la próxima apertura lo reintentará.
+            prefs.edit()
+                .putString("last_error", "No se pudo leer u.tmp: ${e.message}")
+                .apply()
+            return null
+        }
+
+        if (url.isEmpty()) {
+            archivo.delete()
+            prefs.edit().putString("last_error", "u.tmp estaba vacío").apply()
+            return null
+        }
+
+        // Lectura correcta: guardamos y borramos.
+        prefs.edit()
+            .putString("url", url)
+            .remove("last_error")
+            .commit()
+
+        val borrado = archivo.delete()
+        if (!borrado) {
+            prefs.edit().putString("last_error", "No se pudo borrar u.tmp").apply()
+        }
+
+        return url
+    }
+
+    // ---------------- PERMISOS ----------------
 
     private fun tienePermisoTotal(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
         } else {
             ContextCompat.checkSelfPermission(
-                this, Manifest.permission.READ_EXTERNAL_STORAGE
+                this,
+                Manifest.permission.READ_EXTERNAL_STORAGE
             ) == PackageManager.PERMISSION_GRANTED
         }
     }
@@ -104,23 +161,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun importarConfiguracion() {
-        val prefs = getSharedPreferences("config", MODE_PRIVATE)
-        val archivo = File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            "u.tmp"
-        )
-        if (!archivo.exists()) return
-        try {
-            val url = archivo.readText().trim()
-            if (url.isNotEmpty()) {
-                prefs.edit().putString("url", url).apply()
-            }
-        } catch (_: Exception) {
-        } finally {
-            archivo.delete()
-        }
-    }
+    // ---------------- HTTP ----------------
 
     private fun fetchHtml(urlString: String): String {
         val url = URL(urlString)
@@ -135,7 +176,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // --- Información del dispositivo ---
+    // ---------------- INFORMACIÓN DEL DISPOSITIVO ----------------
 
     private fun obtenerInfoDispositivo(): String {
         val sb = StringBuilder()
