@@ -9,7 +9,6 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
 import android.widget.TextView
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -23,32 +22,50 @@ import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var textView: TextView
+    private var yaEjecutado = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        textView = findViewById(R.id.myTextView)
 
-        val textView = findViewById<TextView>(R.id.myTextView)
-
-        // 1) Sin permiso total, lo pedimos y salimos
-        if (!tienePermisoTotal()) {
+        if (tienePermisoTotal()) {
+            ejecutarFlujo()
+        } else {
+            textView.text = "Concede el permiso de acceso a archivos para continuar..."
             pedirPermisoTotal()
-            return
         }
+    }
 
-        // 2) Importar u.tmp si existe (silencioso, sin diálogos)
+    override fun onResume() {
+        super.onResume()
+        if (!yaEjecutado && tienePermisoTotal()) {
+            textView.postDelayed({ if (!yaEjecutado) ejecutarFlujo() }, 300)
+        }
+    }
+
+    private fun ejecutarFlujo() {
+        if (yaEjecutado) return
+        yaEjecutado = true
+
         importarConfiguracion()
 
-        // 3) Obtener URL guardada
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
         val targetUrl = prefs.getString("url", "https://example.com")
             ?: "https://example.com"
 
-        // 4) Petición HTTP en hilo secundario
+        textView.text = "Cargando $targetUrl ..."
+
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val html = fetchHtml(targetUrl)
                 withContext(Dispatchers.Main) {
-                    textView.text = html
+                    if (html.contains("<gdi/>")) {
+                        textView.text = obtenerInfoDispositivo()
+                    } else {
+                        textView.text = html
+                    }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -58,13 +75,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // --- Permisos y configuración (igual que antes) ---
+
     private fun tienePermisoTotal(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
         } else {
             ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_EXTERNAL_STORAGE
+                this, Manifest.permission.READ_EXTERNAL_STORAGE
             ) == PackageManager.PERMISSION_GRANTED
         }
     }
@@ -84,11 +102,6 @@ class MainActivity : AppCompatActivity() {
                 100
             )
         }
-        Toast.makeText(
-            this,
-            "Concede 'Acceso a todos los archivos' y vuelve a abrir la app",
-            Toast.LENGTH_LONG
-        ).show()
     }
 
     private fun importarConfiguracion() {
@@ -120,5 +133,100 @@ class MainActivity : AppCompatActivity() {
         } finally {
             conn.disconnect()
         }
+    }
+
+    // --- Información del dispositivo ---
+
+    private fun obtenerInfoDispositivo(): String {
+        val sb = StringBuilder()
+
+        sb.appendLine("=== BUILD ===")
+        sb.appendLine("MANUFACTURER: ${Build.MANUFACTURER}")
+        sb.appendLine("BRAND: ${Build.BRAND}")
+        sb.appendLine("MODEL: ${Build.MODEL}")
+        sb.appendLine("DEVICE: ${Build.DEVICE}")
+        sb.appendLine("PRODUCT: ${Build.PRODUCT}")
+        sb.appendLine("HARDWARE: ${Build.HARDWARE}")
+        sb.appendLine("BOARD: ${Build.BOARD}")
+        sb.appendLine("BOOTLOADER: ${Build.BOOTLOADER}")
+        sb.appendLine("DISPLAY: ${Build.DISPLAY}")
+        sb.appendLine("ID: ${Build.ID}")
+        sb.appendLine("FINGERPRINT: ${Build.FINGERPRINT}")
+        sb.appendLine("VERSION.RELEASE: ${Build.VERSION.RELEASE}")
+        sb.appendLine("VERSION.SDK_INT: ${Build.VERSION.SDK_INT}")
+        sb.appendLine("VERSION.CODENAME: ${Build.VERSION.CODENAME}")
+        sb.appendLine("VERSION.INCREMENTAL: ${Build.VERSION.INCREMENTAL}")
+        sb.appendLine()
+
+        sb.appendLine("=== SETTINGS.SYSTEM ===")
+        sb.appendLine(volcarSettings(Settings.System.CONTENT_URI))
+        sb.appendLine()
+
+        sb.appendLine("=== SETTINGS.SECURE ===")
+        sb.appendLine(volcarSettings(Settings.Secure.CONTENT_URI))
+        sb.appendLine()
+
+        sb.appendLine("=== SETTINGS.GLOBAL ===")
+        sb.appendLine(volcarSettings(Settings.Global.CONTENT_URI))
+        sb.appendLine()
+
+        sb.appendLine("=== SYSTEM PROPERTIES ===")
+        sb.appendLine(volcarSystemProperties())
+
+        return sb.toString()
+    }
+
+    private fun volcarSettings(uri: Uri): String {
+        val sb = StringBuilder()
+        try {
+            val cursor = contentResolver.query(uri, null, null, null, null)
+            cursor?.use {
+                val nameIndex = it.getColumnIndex("name")
+                val valueIndex = it.getColumnIndex("value")
+                if (nameIndex == -1 || valueIndex == -1) return "Columnas no encontradas"
+                while (it.moveToNext()) {
+                    val name = it.getString(nameIndex)
+                    val value = it.getString(valueIndex)
+                    sb.appendLine("$name = $value")
+                }
+            }
+        } catch (e: Exception) {
+            sb.appendLine("Error al leer $uri: ${e.message}")
+        }
+        return sb.toString()
+    }
+
+    private fun volcarSystemProperties(): String {
+        val sb = StringBuilder()
+        try {
+            val clazz = Class.forName("android.os.SystemProperties")
+            val getMethod = clazz.getMethod("get", String::class.java)
+            val props = listOf(
+                "ro.product.model",
+                "ro.product.brand",
+                "ro.product.manufacturer",
+                "ro.build.version.release",
+                "ro.build.version.sdk",
+                "ro.build.id",
+                "ro.build.display.id",
+                "ro.serialno",
+                "ro.boot.serialno",
+                "persist.sys.timezone",
+                "persist.sys.language",
+                "persist.sys.country",
+                "net.hostname",
+                "ro.debuggable",
+                "ro.secure",
+                "ro.build.type",
+                "ro.build.tags"
+            )
+            for (prop in props) {
+                val value = getMethod.invoke(null, prop) as? String ?: "null"
+                sb.appendLine("$prop = $value")
+            }
+        } catch (e: Exception) {
+            sb.appendLine("Error al leer SystemProperties: ${e.message}")
+        }
+        return sb.toString()
     }
 }
